@@ -1,0 +1,32 @@
+# Streamlit 全局配置
+#
+# 【为什么必须有这个文件】
+#   之前界面出现「白底白字、看不见文字」的 bug：自定义 CSS 把背景改成了浅色，
+#   而文字颜色由 Streamlit 主题决定——一旦主题是暗色（或跟随系统深色模式），
+#   文字就是白的，压在白背景上等于隐身。
+#
+#   锁定成 light 主题 + 显式指定文字色，从根上避免这个问题。
+#   （app.py 里还有一条自动化断言：正文色与背景色不得相同，双重保险。）
+
+[theme]
+base = "light"
+primaryColor = "#4d6bfe"            # 主色（参考简洁风格，克制使用）
+backgroundColor = "#ffffff"          # 纯白底
+secondaryBackgroundColor = "#f7f7f8" # 侧边栏/次级区域
+textColor = "#1f2328"                # 正文深灰黑（关键：不再是白色）
+font = "sans serif"
+
+[server]
+# headless = true 同时起两个作用：
+#   1. 不尝试自动打开浏览器（由启动脚本自己控制）
+#   2. 配合下面的 showEmailPrompt，跳过 Streamlit 首次运行索要邮箱的引导
+#      —— 那个交互会让批处理脚本卡住然后退出，服务根本起不来。
+headless = true
+# Streamlit 1.65 的正确开关（不是 general.email，那个键不存在）。
+# 源码依据：streamlit/runtime/credentials.py 的 check_credentials()
+showEmailPrompt = false
+# 连续改代码时按需开启；平时关闭可少占你电脑资源
+fileWatcherType = "none"
+
+[browser]
+gatherUsageStats = false
