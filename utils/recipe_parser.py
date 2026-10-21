@@ -61,11 +61,25 @@ _ING_RE = re.compile(r"(?:需要食材|食材|用料)\s*\**\s*[：:]\s*(.+)")
 #: 食材条目里的状态前缀，解析前先剥掉
 _ING_PREFIX_RE = re.compile(r"^(?:已有|家里有|现有|需另买|需要买|还缺|缺少|没有)\s*[：:]?\s*")
 
-#: 判断某段食材是否属于「需另买」
-_MISSING_RE = re.compile(r"另买|需买|还缺|缺少|没有")
+#: 判断某段食材是否属于「需另买」（含 ❓/🛒/❌ 这类标记）
+_MISSING_RE = re.compile(r"另买|需买|还缺|缺少|没有|❓|🛒|❌")
+
+#: 判断某段食材是否明确属于「已有」——用于切换回"已有"区段
+_HAVE_MARK_RE = re.compile(r"已有|家里有|现有|不需要买|不用买|✅|✔️")
 
 #: 列表符号与 emoji 前缀
 _ING_BULLET_RE = re.compile(r"^[✅❓🛒✔️❌\-\s•·]+")
+
+#: 状态词扫描：只负责**找出位置**，冒号与空白由调用方一并吃掉。
+#:
+#: ⚠️ 踩过的坑：早期用「前缀逐个试探」的写法（先试 emoji 再试词），
+#:    对「❓ 需另买：姜」只会匹配到 `❓ `，把「需另买：」留在后面的片段里，
+#:    导致状态归属错乱（"冰糖"被算成了"已有"）。
+#:    改成"先全量扫描位置、再统一切分"就没有这个问题。
+#:    注意也要覆盖「不需要买」这种反向表达（它属于"已有"）。
+_STATUS_MARK_RE = re.compile(
+    r"(?:不需要买|已有|家里有|现有|需另买|需要买|还缺|缺少|没有|✅|❓|🛒|✔️|❌|⚠️)"
+)
 
 #: 小标题最大长度（超过这个长度的「编号行」视为普通正文，防止误判）
 _MAX_TITLE_LEN = 40
@@ -222,15 +236,197 @@ def _split_blocks(text: str) -> list[tuple[str, str]]:
     return [(name, "\n".join(body)) for name, body in blocks]
 
 
+def _find_status_marks(text: str) -> list[re.Match[str]]:
+    """扫描全文，找出所有「状态词」出现的位置。
+
+    状态词有两种写法，且**常常叠在一起**：``❓ 需另买：``、``✅ 已有：``。
+    本函数只负责找出位置，具体怎么切分交给 :func:`_split_outside_brackets`。
+
+    ⚠️ 踩过的坑：早期用「前缀逐个试探」的写法，`❓ 需另买：姜` 只会匹配到 `❓ `，
+    把「需另买：」留在后面的片段里，导致状态归属错乱（冰糖被算成"已有"）。
+    改成"先全量扫描位置、再统一切分"就没这个问题了。
+    """
+    return list(_STATUS_MARK_RE.finditer(text or ""))
+
+
+def _split_with_status(text: str) -> list[tuple[str, str]]:
+    """按分隔符切分，并记录每一段属于哪个状态区段。
+
+    为什么要返回状态（真实事故）：
+        切分器会**把状态词从数据里剥掉**（这是必要的，否则「需另买」会被当成食材）。
+        但剥离之后，如果还想去片段里搜索状态词来判断归属，就永远搜不到——
+        结果所有条目都被算成"已有"（"冰糖"被归错的根因）。
+        所以状态必须在切分时就记下来，随片段一起返回。
+
+    Returns:
+        ``[(片段内容, 状态)]``，状态取值：
+            ``"missing"`` 需另买 / ``"have"`` 已有 / ``""`` 未标注（沿用上一段）
+    """
+    delimiters = "、,，;；"
+    bracket_pairs = {"（": "）", "(": ")", "【": "】", "[": "]"}
+    closers = set(bracket_pairs.values())
+
+    # 预先算出所有状态词的位置，并让它后面的冒号一并被吃掉
+    status_spans: dict[int, tuple[int, str]] = {}
+    for mark in _find_status_marks(text):
+        end = mark.end()
+        while end < len(text) and text[end] in "：: \t":
+            end += 1
+        token = mark.group(0)
+        if _MISSING_RE.search(token):
+            state = "missing"
+        elif _HAVE_MARK_RE.search(token):
+            state = "have"
+        else:
+            state = ""
+        status_spans[mark.start()] = (end, state)
+
+    segments: list[tuple[str, str]] = []
+    current: list[str] = []
+    stack: list[str] = []
+    index = 0
+
+    while index < len(text):
+        char = text[index]
+
+        # 括号外遇到状态词 → 在此切分，并把连续出现的状态词全部吃掉。
+        # ⚠️ 必须 while 而不是 if：模型常写「❓ 需另买：」这种叠加形态，
+        #    if 只跳过一个标记会落在下一个状态词中间。
+        if not stack and index in status_spans:
+            if current:
+                segments.append(("".join(current), ""))
+                current = []
+            state = ""
+            while index in status_spans:
+                index, state = status_spans[index]
+            # 用新的状态标记"接下来这一段"的归属
+            if state:
+                segments.append(("", state))  # 占位段：仅用于传递状态
+            continue
+
+        if char in bracket_pairs:
+            stack.append(bracket_pairs[char])
+        elif char in closers and stack and stack[-1] == char:
+            stack.pop()
+
+        if char in delimiters and not stack:
+            if current:
+                segments.append(("".join(current), ""))
+                current = []
+            index += 1
+            continue
+
+        current.append(char)
+        index += 1
+
+    if current:
+        segments.append(("".join(current), ""))
+
+    return segments
+
+
+def _split_outside_brackets(text: str) -> list[str]:
+    """按分隔符切分文本（只返回内容，忽略状态区段）。
+
+    供需要"纯内容列表"的场景使用；需要归属信息请用 :func:`_split_with_status`。
+    """
+    return [content for content, _state in _split_with_status(text) if content]
+
+
+#: 括号内的「纯数量」写法（这种才值得留在标签里；空括号或无意义内容要剥掉）
+_BRACKET_CONTENT_RE = re.compile(r"^[（(\[【]\s*(.*?)\s*[）)\]}】]$")
+
+#: 判定「括号内容有没有实际意义」：含中文/字母/数字才算
+_MEANINGFUL_RE = re.compile(r"[\u4e00-\u9fffA-Za-z0-9]")
+
+#: 空括号（只有空白/标点）——要连括号一起剥掉
+_EMPTY_BRACKET_RE = re.compile(r"[（(\[【]\s*[）)\]}】]")
+
+#: 一个合法的括号组
+_BRACKET_GROUP_RE = re.compile(r"[（(\[【][^（()）\[\]【】]*[）)\]}】]")
+
+
+def _tidy_bracket(item: str) -> str:
+    """清理标签里的括号。
+
+    处理三类脏数据：
+        1. 空括号「番茄（ ）」→ 连括号剥掉，得到「番茄」
+        2. 重复/畸形括号「番茄（1个）（瓶装」→ 只保留第一个合法括号组
+        3. 括号内容有意义「排骨（2-3个）」→ 原样保留（数量信息对用户有用）
+    """
+    text = _EMPTY_BRACKET_RE.sub("", item).strip()
+
+    groups = _BRACKET_GROUP_RE.findall(text)
+    if not groups:
+        # 没有任何合法括号组：把残缺的括号字符清掉（例如结尾孤零零的「（」）
+        return text.strip("（）()[]【】 ").strip()
+
+    first = groups[0]
+    name = text[: text.index(first)].strip()
+    tail = text[text.index(first) + len(first) :].strip()
+    # 括号组后面还有残留内容（基本是脏数据，如「（瓶装」），丢弃
+    if tail and not _MEANINGFUL_RE.sub("", tail).strip():
+        tail = ""
+    return f"{name}{first}{tail}".strip() if not tail else f"{name}{first}".strip()
+
+
+def _is_renderable_ingredient(item: str) -> bool:
+    """判断一个食材标签值不值得渲染。
+
+    ⚠️ 这是给「脏数据」兜的第二道防线（前端渲染规则见 README 的视觉规范）：
+        空字符串、纯符号、残缺括号（如 `（`、`（瓶装`、`）`）一律丢弃。
+
+    返回 False 的条目会被**直接过滤，界面完全不渲染**——不留空占位、不留灰条。
+    这样即使模型输出格式再离谱，用户也不会看到「（ ）」这种空壳标签。
+
+    允许的形态：
+        - `排骨`                     纯名字
+        - `排骨（2-3个）`            名字 + 一个合法括号组
+        - `生抽/少许老抽`            名字里带斜杠
+    拒绝的形态：
+        - 空串、纯标点、纯 emoji
+        - 括号不成对（`（`、`（瓶装`、`）`）
+        - 出现两组及以上括号（畸形）
+        - 剥掉括号后没有实体名（`（2-3个）`）
+    """
+    text = item.strip()
+    if not text or not _MEANINGFUL_RE.search(text):
+        return False
+
+    open_count = sum(text.count(ch) for ch in "（(【[")
+    close_count = sum(text.count(ch) for ch in "）)】]")
+    if open_count != close_count:
+        return False
+
+    groups = _BRACKET_GROUP_RE.findall(text)
+    if len(groups) > 1:
+        return False
+    if any(not _MEANINGFUL_RE.search(g[1:-1]) for g in groups):
+        return False
+
+    # 剥掉合法括号组后必须还有实体名
+    remainder = text
+    for group in groups:
+        remainder = remainder.replace(group, "", 1)
+    if not _MEANINGFUL_RE.search(remainder):
+        return False
+
+    # 括号只能出现在末尾（「番茄（1个）」合法；「（1个）番茄」不合法）
+    if groups and not text.rstrip().endswith(tuple("）)】]")):
+        return False
+    return True
+
+
 def _parse_ingredients(body: str) -> tuple[list[str], list[str]]:
     """从正文里切出「已有食材」与「需另买食材」。
 
     模型常见的两种写法：
 
         ``- 🧺 **需要食材**：✅ 已有：西红柿、鸡蛋　❓ 需另买：玉米淀粉``
-        ``- 🧺 **需要食材**：西红柿、鸡蛋、小葱``
+        ``- 🧺 **需要食材**：排骨（2-3个）、番茄（1个）、姜``
 
     注意全角空格（``　``）会被模型当作分隔符使用，所以先统一成半角空格再切。
+    括号内的分隔符不会切断（见 _split_outside_brackets）。
     """
     matched = _ING_RE.search(body)
     if not matched:
@@ -240,19 +436,53 @@ def _parse_ingredients(body: str) -> tuple[list[str], list[str]]:
     have: list[str] = []
     missing: list[str] = []
 
-    # 按分隔符切条；同时用状态词做前瞻切分，保证「已有：A、B 需另买：C」能正确分段
-    for piece in re.split(r"[、,，;；]|(?=(?:✅|❓|🛒|✔️|❌|已有|需另买|需要买|还缺|缺少))", raw):
+    # 第二道兜底：模型偶尔会把「`排骨（2-3个）`」拆成两条（`排骨` + `（2-3个）`）。
+    # 遇到以括号开头的片段，**合并回上一条**，恢复成完整标签，
+    # 而不是丢掉（丢了会少信息）或原样渲染（就是用户截图里的脏标签）。
+    # 注意：合并时要**保留该片段的状态**，否则归属会丢。
+    merged: list[tuple[str, str]] = []
+    for piece, section in _split_with_status(raw):
+        cleaned_piece = clean_md(piece).strip()
+        if cleaned_piece.startswith(("（", "(", "【", "[")) and merged:
+            prev_text, prev_section = merged[-1]
+            combined = f"{prev_text}{cleaned_piece}"
+            # 只有当合并结果**本身是干净的标签**时才合并；
+            # 否则（例如原始文本里括号没闭合，导致残渣被一起带进来）
+            # 只保留前一个完整标签，丢弃残渣——宁可少一个脏标签，也不要渲染出
+            # 「番茄（ ）（瓶装」这种畸形内容。
+            if prev_text and _is_renderable_ingredient(combined):
+                merged[-1] = (combined, prev_section or section)
+            elif not prev_text:
+                merged[-1] = (combined, prev_section or section)
+            continue
+        merged.append((piece, section))
+
+    # 归属判定：状态区段由切分器随片段一起返回（见 _split_with_status）。
+    # ⚠️ 踩过的坑：早期想看"片段自己有没有带状态词"来判断，
+    #    但状态词在切分时已经被剥掉（否则会被当成食材），于是永远搜不到，
+    #    结果「❓ 需另买：姜、冰糖」里的姜和冰糖都被算成了"已有"。
+    in_missing_section = False
+
+    for piece, section in merged:
+        if section == "missing":
+            in_missing_section = True
+        elif section == "have":
+            in_missing_section = False
+        if not piece:
+            continue  # 占位段，只用来传递状态
         item = clean_md(piece)
         item = _ING_BULLET_RE.sub("", item).strip()
         item = _ING_PREFIX_RE.sub("", item).strip()
         item = item.strip("：: ").strip()
+        item = _tidy_bracket(item).strip()
         if not item:
             continue
-        # 判断归属时看「原始片段」是否带状态词，避免剥前缀后丢失信息
-        if _MISSING_RE.search(piece):
-            missing.append(item)
-        else:
-            have.append(item)
+        if not _is_renderable_ingredient(item):
+            # 脏数据（空标签/纯符号/残缺括号）直接丢弃，界面不渲染
+            logger.debug("丢弃无法渲染的食材标签：%r", item)
+            continue
+
+        (missing if in_missing_section else have).append(item)
 
     return have, missing
 
@@ -339,17 +569,24 @@ def render_recipe_card_html(card: RecipeCard) -> str:
     html.extend(chips)
     html.append("</div>")
 
+    # ---------- 食材标签区 ----------
+    # 布局规范（与 app.py 的 .ing-list / .ing-chip 对应）：
+    #   • 用 flex + gap 而不是 margin —— 换行后左右间距均匀，不会出现"行尾多余空隙"
+    #   • 空分组**整块不渲染** —— 过滤掉脏标签后不会留下空行或占位灰条
+    #   • 「已有」与「需另买」分成两行，各自带小标题，避免两种语义混在一个流里
     if card.ingredients:
         items = "".join(f'<span class="ing-chip">{item}</span>' for item in card.ingredients[:14])
-        html.append(f"<div>{items}</div>")
+        html.append(f'<div class="ing-row"><span class="ing-row-label">已有</span><div class="ing-list">{items}</div></div>')
     if card.missing:
         items = "".join(f'<span class="ing-chip missing">{item}</span>' for item in card.missing[:10])
-        html.append(f'<div style="margin-top:4px">{items}</div>')
+        html.append(
+            f'<div class="ing-row"><span class="ing-row-label">需另买</span>'
+            f'<div class="ing-list">{items}</div></div>'
+        )
     if card.link:
         text = card.link_text or "查看原菜谱"
         html.append(
-            f'<div style="margin-top:10px"><a href="{card.link}" target="_blank" '
-            f'style="color:#e8590c;font-weight:600;text-decoration:none">🔗 {text} ↗</a></div>'
+            f'<div class="recipe-source"><a href="{card.link}" target="_blank">🔗 {text} ↗</a></div>'
         )
 
     html.append("</div>")

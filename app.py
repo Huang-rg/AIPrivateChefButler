@@ -1,12 +1,11 @@
 """★ AI私厨管家 · Streamlit Web UI 入口
 
 启动方式：
-    1. 先按 README 建好虚拟环境并安装依赖：pip install -r requirements.txt
-    2. 复制 .env.example 为 .env，填入自己的 API Key
-    3. 启动：
-           streamlit run app.py
+    1. pip install -r requirements.txt
+    2. streamlit run app.py
+    （首次运行前请复制 .env.example 为 .env 并填入你自己的 API Key）
 
-【界面设计原则】
+【界面设计原则（按用户反馈重做）】
     1. **白底黑字**：整页纯白 #ffffff，正文 #1f2328。之前在浅色背景上没显式设置
        文字颜色，一旦主题是暗色就变成「白底白字、看不见内容」。现在颜色全部写死，
        并且颜色定义集中在下面的 THEME 字典里，改一处即可换肤。
@@ -136,12 +135,38 @@ _CSS = f"""
     .chip-grade-B {{ background: {THEME['grade_b_bg']}; color: {THEME['grade_b_fg']}; border-color: {THEME['grade_b_bg']}; }}
     .chip-grade-C {{ background: {THEME['grade_c_bg']}; color: {THEME['grade_c_fg']}; border-color: {THEME['grade_c_bg']}; }}
     .chip-ready {{ background: #e8f1ff; color: #1d4ed8; border-color: #e8f1ff; }}
+    /* ---------- 食材标签区 ----------
+       布局规范（解决"脏标签挤在一起 / 过滤后留空档"两个问题）：
+
+       1. 容器用 flex + gap，而不是给每个标签加 margin：
+          换行时左右间距均匀，不会出现"行尾多出一截空隙"的错位感。
+       2. 标签一律 nowrap（单个标签内部不折行），过长时靠 max-width + 省略号收敛，
+          绝不让一个标签被拆成两行、把整块布局挤歪。
+       3. 分组标题（已有 / 需另买）单独一列，与标签区对齐；空分组整块不渲染，
+          所以过滤掉脏标签后**不会留下空行或占位灰条**。
+       4. 过滤规则见 utils/recipe_parser.py 的 _is_renderable_ingredient：
+          空标签、纯符号、残缺括号一律丢弃，不占位。 */
+    .ing-row {{
+        display: flex; align-items: flex-start; gap: 8px; margin-top: 8px;
+    }}
+    .ing-row-label {{
+        flex: 0 0 auto; font-size: 12px; color: {THEME['text_faint']};
+        line-height: 24px; padding-top: 1px; white-space: nowrap;
+    }}
+    .ing-list {{
+        display: flex; flex-wrap: wrap; gap: 6px; flex: 1 1 auto; min-width: 0;
+    }}
     .ing-chip {{
-        display: inline-block; margin: 0 5px 5px 0; padding: 3px 9px;
-        border-radius: 999px; font-size: 12.5px;
+        display: inline-block; max-width: 100%;
+        padding: 3px 9px; border-radius: 999px; font-size: 12.5px;
+        line-height: 18px; white-space: nowrap;
+        overflow: hidden; text-overflow: ellipsis;
         background: {THEME['hover']}; color: {THEME['text']}; border: 1px solid {THEME['border']};
     }}
-    .ing-chip.missing {{ color: {THEME['text_faint']}; }}
+    .ing-chip.missing {{ color: {THEME['text_faint']}; background: {THEME['bg']}; }}
+    .recipe-source {{ margin-top: 10px; }}
+    .recipe-source a {{ color: #e8590c; font-weight: 600; text-decoration: none; }}
+    .recipe-source a:hover {{ text-decoration: underline; }}
 
     /* ---------- 会话列表 ---------- */
     .hist-title {{ font-size: 12px; color: {THEME['text_faint']}; font-weight: 700;
@@ -179,19 +204,18 @@ st.markdown(_CSS, unsafe_allow_html=True)
 # 三、会话状态
 # --------------------------------------------------------------------------- #
 
-#: 待发送图片的暂存键（按来源分开，避免上传与摄像头互相覆盖）
-PENDING_KEYS: dict[str, str] = {
-    "upload": "__pending_upload__",
-    "camera": "__pending_camera__",
-    "clipboard": "__pending_clipboard__",
-    "url": "__pending_url__",
-}
+#: 待发送图片存放在 st.session_state["staged_images"]，是一个**列表**，
+#: 每项 ``{"id": int, "payload": ImagePayload, "source": str}``。
+#: 用列表而不是"按来源分键"，是为了支持**逐张删除**（每张图有独立 id 和删除按钮）。
+STAGED_IMAGES_KEY: Final[str] = "staged_images"
 
 
 def _init_state() -> None:
     defaults: dict[str, Any] = {
         "messages": [],          # 界面展示的消息流
         "thread_id": None,       # 当前会话 ID
+        "staged_images": [],     # 待发送图片列表（每项带 id，可逐张删除）
+        "image_seq": 0,          # 图片 id 自增序号（保证删除按钮的 key 稳定唯一）
         "last_image": None,      # 最近一次图片（供后续追问继续引用）
         "chef": None,            # ChefAgent
         "chef_signature": None,  # 建 Agent 时的配置指纹（模型变了要重建）
@@ -333,17 +357,43 @@ def _register_session(title_source: str, message_count: int) -> None:
     store.upsert_session(st.session_state.thread_id, title=title, message_count=message_count)
 
 
+def _restore_message(message: dict[str, Any]) -> dict[str, Any]:
+    """把从数据库恢复的一条消息，还原成界面可以完整渲染的结构。
+
+    ⚠️ 真实事故（用户报的最严重问题）：
+        早期版本恢复历史时把 ``parsed`` 一律设成 None，于是助手消息
+        **只渲染原始 Markdown**，菜谱卡片和「查看完整内容」入口统统消失——
+        用户重进会话后只能看到完整版，再也切不回带关键词标签的卡片视图。
+
+    这里对助手消息**重新解析一次**：
+        数据库里存的是完整回复文本（含食材、步骤、来源链接），
+        解析器对同一段文本是**稳定可重现**的，所以能完整还原卡片与切换入口。
+    """
+    role = message.get("role", "user")
+    content = message.get("content", "")
+    restored: dict[str, Any] = {"role": role, "content": content, "parsed": None}
+
+    if role == "assistant" and content:
+        try:
+            parsed = parse_recipes_from_text(content)
+            restored["parsed"] = parsed or None
+        except Exception as exc:  # noqa: BLE001 - 解析失败就退回纯文本，不影响阅读
+            logger.debug("恢复历史时解析菜谱卡片失败（退回纯文本）：%s", exc)
+
+    return restored
+
+
 def _switch_session(thread_id: str) -> None:
-    """切换到另一个会话：从检查点恢复完整对话。"""
+    """切换到另一个会话：从检查点恢复完整对话。
+
+    恢复后必须与「首次对话」表现完全一致——
+    包括菜谱卡片、食材标签，以及「查看完整内容」的切换入口。
+    """
     store = _store()
     restored = store.load_messages(thread_id) if store.available() else []
     st.session_state.thread_id = thread_id
-    st.session_state.messages = [
-        {"role": m["role"], "content": m["content"], "parsed": None} for m in restored
-    ]
-    st.session_state.last_image = None
-    for key in PENDING_KEYS.values():
-        st.session_state.pop(key, None)
+    st.session_state.messages = [_restore_message(m) for m in restored]
+    _clear_staged_images()
     st.rerun()
 
 
@@ -352,9 +402,7 @@ def _new_session() -> None:
 
     st.session_state.thread_id = new_thread_id()
     st.session_state.messages = []
-    st.session_state.last_image = None
-    for key in PENDING_KEYS.values():
-        st.session_state.pop(key, None)
+    _clear_staged_images()
     st.session_state.uploader_key += 1
     st.rerun()
 
@@ -483,29 +531,88 @@ def _render_model_switcher() -> None:
 # --------------------------------------------------------------------------- #
 # 七、图片输入（四条路）
 # --------------------------------------------------------------------------- #
+#
+# 【数据结构】待发送的图片是一个**列表**，每张带自己的 id，支持逐张删除。
+#   真实需求（用户反馈）：原来只有一个「一键清空」，把剪贴板图和上传图一起删掉，
+#   太粗暴。现在每张图右上角有独立删除按钮，想留哪张留哪张。
+#
+#   每一项形如：{"id": 自增序号, "payload": ImagePayload, "source": "upload"/"clipboard"/…}
+
+#: 图片来源的中文名（用于界面标注）
+SOURCE_LABELS: dict[str, str] = {
+    "upload": "上传",
+    "camera": "拍照",
+    "clipboard": "剪贴板",
+    "url": "图片网址",
+    "cache": "缓存",
+}
+
+
+def _staged_images() -> list[dict[str, Any]]:
+    """取出当前所有待发送图片（不清除）。"""
+    staged = st.session_state.get("staged_images")
+    if not isinstance(staged, list):
+        staged = []
+        st.session_state.staged_images = staged
+    return staged
 
 
 def _stage_image(payload: Any, source: str) -> None:
-    """把一张图片放进待发送区。"""
-    st.session_state[PENDING_KEYS[source]] = payload
+    """把一张图片加入待发送区（**追加**，不覆盖已有的）。"""
+    staged = _staged_images()
+    st.session_state.image_seq = int(st.session_state.get("image_seq", 0)) + 1
+    staged.append({"id": st.session_state.image_seq, "payload": payload, "source": source})
     st.session_state.last_image = payload
 
 
-def _pending_image() -> Any | None:
-    """取当前待发送的图片（不清除）。"""
-    for key in PENDING_KEYS.values():
-        payload = st.session_state.get(key)
-        if payload is not None:
-            return payload
-    return None
+def _remove_staged_image(image_id: int) -> None:
+    """删除指定的待发送图片（只删这一张，其余保留）。"""
+    staged = _staged_images()
+    remaining = [item for item in staged if item.get("id") != image_id]
+    st.session_state.staged_images = remaining
+    # 同步更新"最近一张图片"（供后续追问继续引用）
+    st.session_state.last_image = remaining[-1]["payload"] if remaining else None
 
 
-def _take_pending_image() -> Any | None:
-    """取出待发送图片并清空暂存。"""
-    payload = _pending_image()
-    for key in PENDING_KEYS.values():
-        st.session_state.pop(key, None)
-    return payload
+def _clear_staged_images() -> None:
+    """清空所有待发送图片。"""
+    st.session_state.staged_images = []
+    st.session_state.last_image = None
+
+
+def _render_staged_images(*, with_delete: bool = True) -> None:
+    """把待发送图片逐张渲染出来，每张右上角带独立删除按钮。
+
+    Args:
+        with_delete: 是否显示删除按钮（主区只做预览时可关掉，避免重复 key）。
+    """
+    from utils.image_handler import describe_image
+
+    staged = _staged_images()
+    if not staged:
+        return
+
+    st.markdown(f"**待发送图片（{len(staged)} 张）**")
+    for item in list(staged):
+        image_id = item.get("id")
+        payload = item.get("payload")
+        label = SOURCE_LABELS.get(item.get("source", ""), "图片")
+        try:
+            caption = f"{label}｜{describe_image(payload)}"
+        except Exception:  # noqa: BLE001
+            caption = label
+
+        if with_delete:
+            col_img, col_del = st.columns([8, 1])
+            with col_img:
+                st.image(payload.raw_bytes, caption=caption, use_container_width=True)
+            with col_del:
+                # 独立删除按钮：只删这一张
+                if st.button("✕", key=f"del_img_{image_id}", help="删除这张图片"):
+                    _remove_staged_image(image_id)
+                    st.rerun()
+        else:
+            st.image(payload.raw_bytes, caption=caption, use_container_width=True)
 
 
 def _render_image_inputs() -> None:
@@ -517,26 +624,36 @@ def _render_image_inputs() -> None:
         type=["jpg", "jpeg", "png", "webp", "bmp", "gif"],
         key=f"uploader_{st.session_state.uploader_key}",
         label_visibility="collapsed",
+        accept_multiple_files=True,
     )
-    if uploaded is not None:
-        try:
-            from utils.image_handler import describe_image, prepare_image_from_uploaded_file
+    if uploaded:
+        files = uploaded if isinstance(uploaded, list) else [uploaded]
+        for handle in files:
+            try:
+                from utils.image_handler import prepare_image_from_uploaded_file
 
-            payload = prepare_image_from_uploaded_file(uploaded)
-            _stage_image(payload, "upload")
-            st.image(payload.raw_bytes, caption=f"✅ {describe_image(payload)}", use_container_width=True)
-        except Exception as exc:  # noqa: BLE001
-            st.error(f"图片读取失败：{exc}")
+                payload = prepare_image_from_uploaded_file(handle)
+                # 同一张图重复上传时不要重复入列（按内容指纹去重）
+                already = any(
+                    item["payload"].raw_bytes == payload.raw_bytes
+                    for item in _staged_images()
+                )
+                if already:
+                    continue
+                _stage_image(payload, "upload")
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"图片读取失败：{exc}")
 
     with st.expander("📸 摄像头拍照", expanded=False):
         camera = st.camera_input("用摄像头拍一张", key=f"camera_{st.session_state.uploader_key}")
         if camera is not None:
             try:
-                from utils.image_handler import describe_image, prepare_image_from_uploaded_file
+                from utils.image_handler import prepare_image_from_uploaded_file
 
                 payload = prepare_image_from_uploaded_file(camera)
-                _stage_image(payload, "camera")
-                st.image(payload.raw_bytes, caption=f"✅ {describe_image(payload)}", use_container_width=True)
+                already = any(item["payload"].raw_bytes == payload.raw_bytes for item in _staged_images())
+                if not already:
+                    _stage_image(payload, "camera")
             except Exception as exc:  # noqa: BLE001
                 st.error(f"拍照读取失败：{exc}")
 
@@ -549,17 +666,15 @@ def _render_image_inputs() -> None:
             if probe.has_image:
                 _stage_image(probe.payload, "clipboard")
                 st.session_state.clip_fp_seen = probe.fingerprint
-                st.success(f"已读入剪贴板图片（{probe.description}）")
                 st.rerun()
             else:
                 st.warning(probe.error or "剪贴板里没有图片。")
         except Exception as exc:  # noqa: BLE001
             st.error(f"读取剪贴板失败：{exc}")
 
-    if col_b.button("🧹 清空图片", use_container_width=True):
-        for key in PENDING_KEYS.values():
-            st.session_state.pop(key, None)
-        st.session_state.last_image = None
+    # 这个按钮保留为"全部清空"的快捷方式，但逐张删除请用每张图上的 ✕
+    if col_b.button("🧹 全部清空", use_container_width=True, help="清空所有待发送图片（想单张删除请点图片右上角的 ✕）"):
+        _clear_staged_images()
         st.session_state.uploader_key += 1
         st.rerun()
 
@@ -568,18 +683,14 @@ def _render_image_inputs() -> None:
         if st.button("下载这张图", use_container_width=True):
             try:
                 from utils.image_input import download_image_cached
-                from utils.image_handler import describe_image
 
                 payload = download_image_cached(url.strip())
                 _stage_image(payload, "url")
-                st.success(f"已下载（{describe_image(payload)}）")
                 st.rerun()
             except Exception as exc:  # noqa: BLE001
                 st.error(f"下载失败：{exc}")
 
-    pending = _pending_image()
-    if pending is not None:
-        st.image(pending.raw_bytes, caption="待发送的图片", use_container_width=True)
+    _render_staged_images(with_delete=True)
 
 
 def _render_clipboard_hint() -> None:
@@ -734,18 +845,23 @@ def _render_answer(content: str, parsed: list[RecipeCard] | None) -> None:
 
 
 def _handle_input(user_text: str, settings: dict[str, Any]) -> None:
-    """处理一次输入：可能是文字、可能是图片地址、也可能带待发送图片。"""
+    """处理一次输入：可能是文字、可能是图片地址、也可能带若干张待发送图片。"""
     from utils.image_input import ImageInputError, detect_image_url, download_image_cached
 
-    staged = _take_pending_image()
+    # 取出所有待发送图片（多图），并清空暂存区
+    staged_items = _staged_images()
+    staged_payloads = [item["payload"] for item in staged_items]
+    st.session_state.staged_images = []
+
     image_url = detect_image_url(user_text)
 
     # 情况一：用户粘贴了图片地址 → 服务端下载后当成图片处理
-    if staged is None and image_url:
+    if not staged_payloads and image_url:
         try:
             with st.spinner("正在下载图片…"):
-                staged = download_image_cached(image_url)
-            st.session_state.last_image = staged
+                downloaded = download_image_cached(image_url)
+            staged_payloads = [downloaded]
+            st.session_state.last_image = downloaded
         except ImageInputError as exc:
             st.session_state.messages.append({"role": "user", "content": user_text})
             st.session_state.messages.append(
@@ -753,11 +869,19 @@ def _handle_input(user_text: str, settings: dict[str, Any]) -> None:
             )
             return
 
-    image_for_turn = staged or st.session_state.last_image
+    # 本轮要送给模型的图片：优先用刚暂存的；没有则沿用上一轮那张（方便追问）
+    images_for_turn = staged_payloads or ([st.session_state.last_image] if st.session_state.last_image else [])
+    if staged_payloads:
+        st.session_state.last_image = staged_payloads[-1]
 
-    message: dict[str, Any] = {"role": "user", "content": user_text, "has_image": image_for_turn is not None}
-    if staged is not None:
-        message["image_b64"] = staged.base64_str
+    message: dict[str, Any] = {
+        "role": "user",
+        "content": user_text,
+        "has_image": bool(images_for_turn),
+    }
+    # 只把**本轮新上传**的图存进消息用于回显（避免每轮重复展示旧图）
+    if staged_payloads:
+        message["images_b64"] = [p.base64_str for p in staged_payloads]
     st.session_state.messages.append(message)
 
     chef, error = _ensure_chef()
@@ -771,7 +895,8 @@ def _handle_input(user_text: str, settings: dict[str, Any]) -> None:
         f"{user_text}\n\n（请最多推荐 {settings['max_results']} 个菜谱；"
         f"排序偏好：{settings['sort_pref']}。）"
     )
-    payload: list[Any] = [image_for_turn, prompt] if image_for_turn is not None else [prompt]
+    # 多图 + 文本一起送给模型
+    payload: list[Any] = [*images_for_turn, prompt]
 
     with st.chat_message("assistant", avatar="🍳"):
         placeholder = st.empty()
@@ -824,10 +949,16 @@ def main() -> None:
         for message in st.session_state.messages:
             role = message.get("role", "user")
             with st.chat_message(role, avatar="🧑‍🍳" if role == "user" else "🍳"):
-                if message.get("image_b64"):
+                # 用户消息里附带的图片（支持多张）
+                for encoded in message.get("images_b64") or []:
+                    try:
+                        st.image(base64.b64decode(encoded), width=240)
+                    except Exception:  # noqa: BLE001 - 图片只是装饰，坏了不影响文字
+                        pass
+                if message.get("image_b64"):  # 兼容旧结构
                     try:
                         st.image(base64.b64decode(message["image_b64"]), width=240)
-                    except Exception:  # noqa: BLE001 - 图片只是装饰，坏了不影响文字
+                    except Exception:  # noqa: BLE001
                         pass
                 if role == "assistant":
                     if message.get("tool_names"):
@@ -843,9 +974,8 @@ def main() -> None:
     user_text = st.chat_input("说说你的食材、口味或忌口…（也可以直接粘贴图片网址）")
     if user_text:
         with st.chat_message("user", avatar="🧑‍🍳"):
-            waiting = _pending_image()
-            if waiting is not None:
-                st.image(waiting.raw_bytes, width=240)
+            for item in _staged_images():
+                st.image(item["payload"].raw_bytes, width=240)
             st.markdown(user_text)
         _handle_input(user_text, settings)
         st.rerun()
@@ -855,6 +985,13 @@ def main() -> None:
         "菜谱来源为第三方网站，请以实际为准</div>",
         unsafe_allow_html=True,
     )
+
+    # 「↓ 滚动到最新消息」悬浮按钮：
+    # 只在用户向上翻看历史、视图不在底部时浮现；点击平滑滚到底部后自动隐藏。
+    # 有新消息而用户不在底部时，按钮上会显示未读条数。
+    from utils.scroll_button import render_scroll_to_latest
+
+    render_scroll_to_latest()
 
 
 if __name__ == "__main__":
